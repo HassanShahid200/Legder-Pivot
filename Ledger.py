@@ -15,7 +15,6 @@ if uploaded_file is not None:
         
         gl_df['Posting Date'] = pd.to_datetime(gl_df['Posting Date'])
         
-        # Sirf September (Month == 9) ka data filter karein
         sep_df = gl_df[gl_df['Posting Date'].dt.month == 9].copy()
         sep_df['Year'] = sep_df['Posting Date'].dt.year.astype(str)
         
@@ -30,7 +29,6 @@ if uploaded_file is not None:
     try:
         df = load_data(uploaded_file)
         
-        # Sequence lock karne ke liye Categorical sorting
         main_class_order = [
             'Sales - net',
             'Cost of sales',
@@ -44,7 +42,6 @@ if uploaded_file is not None:
         
         df['Main_Class_Sort'] = pd.Categorical(df['Current Main Class'], categories=main_class_order, ordered=True)
         
-        # Pivot table banayein
         pivot_df = pd.pivot_table(
             df, 
             values='Deb./Cred. (LC)', 
@@ -54,7 +51,6 @@ if uploaded_file is not None:
             fill_value=0
         ).reset_index()
 
-        # Columns ko explicitly text mein convert karein taake blank screen issue na aaye
         pivot_df.columns = [str(c) for c in pivot_df.columns]
         
         if '2025' in pivot_df.columns:
@@ -67,32 +63,31 @@ if uploaded_file is not None:
         else:
             pivot_df['Sep 2026'] = 0.0
 
-        # % Change Formula
         pivot_df['% Change'] = (pivot_df['Sep 2026'] - pivot_df['Sep 2025']) / pivot_df['Sep 2025'].replace(0, pd.NA)
         pivot_df['% Change'] = pivot_df['% Change'].fillna(0)
 
-        # Sort karne ke baad 'Main_Class_Sort' drop kar dein taake AgGrid crash na ho
         pivot_df = pivot_df.sort_values(by=['Main_Class_Sort', 'Current Sub Class', 'Title'])
         pivot_df = pivot_df.drop(columns=['Main_Class_Sort'])
         
-        # Tamam classes ko strictly string banayein
         pivot_df['Current Main Class'] = pivot_df['Current Main Class'].astype(str)
         pivot_df['Current Sub Class'] = pivot_df['Current Sub Class'].astype(str)
         pivot_df['Title'] = pivot_df['Title'].astype(str)
 
         st.subheader("1. September Summary Pivot")
-        st.write("Table ko expand karein aur account row ko tick karein.")
+        st.write("Table ko expand karein aur kisi bhi account ke amount par click karein.")
 
-        # Interactive AgGrid Setup
         gb = GridOptionsBuilder.from_dataframe(pivot_df)
         gb.configure_column('Current Main Class', rowGroup=True, hide=True)
         gb.configure_column('Current Sub Class', rowGroup=True, hide=True)
         gb.configure_column('Title', rowGroup=False)
-        gb.configure_column('Sep 2026', type=["numericColumn"], valueFormatter="x.toLocaleString('en-US', {minimumFractionDigits: 2})")
-        gb.configure_column('Sep 2025', type=["numericColumn"], valueFormatter="x.toLocaleString('en-US', {minimumFractionDigits: 2})")
+        
+        # FIXED: aggFunc='sum' add kiya hai taake groups blank na rahein
+        gb.configure_column('Sep 2026', type=["numericColumn"], valueFormatter="x.toLocaleString('en-US', {minimumFractionDigits: 2})", aggFunc='sum')
+        gb.configure_column('Sep 2025', type=["numericColumn"], valueFormatter="x.toLocaleString('en-US', {minimumFractionDigits: 2})", aggFunc='sum')
         gb.configure_column('% Change', valueFormatter="x.toLocaleString(undefined, {style: 'percent', minimumFractionDigits: 2})")
         
-        gb.configure_selection(selection_mode='single', use_checkbox=True)
+        # FIXED: use_checkbox=False kar diya hai. Ab amount/row par direct click kaam karega.
+        gb.configure_selection(selection_mode='single', use_checkbox=False)
         gridOptions = gb.build()
 
         grid_response = AgGrid(
@@ -115,13 +110,12 @@ if uploaded_file is not None:
                 
             selected_title = selected_row.get('Title')
             
-            if selected_title:
+            # Agar group header par click hua toh Title None/NaN hoga
+            if pd.notna(selected_title) and selected_title != "":
                 st.subheader(f"2. Fact Ledger Detail: {selected_title}")
                 
-                # Naya Feature: Saal choose karne ke liye button!
                 selected_year = st.radio("👇 Konsay saal ka poora ledger dekhna chahte hain?", ["2026", "2025"], horizontal=True)
                 
-                # Sirf selected saal aur selected account ka data filter hoga
                 detail_df = df[(df['Title'] == selected_title) & (df['Year'] == selected_year)]
                 
                 cols_to_show = ['Acct Code', 'Posting Date', 'Origin', 'Doc No', 'Remarks', 'Offset Acct', 'Offset Acct Name', 'Deb./Cred. (LC)']
@@ -134,9 +128,9 @@ if uploaded_file is not None:
                     hide_index=True
                 )
             else:
-                st.info("💡 Aapne ek Category select ki hai. Poora ledger dekhne ke liye plus (+) se usko expand karein aur andar se kisi ek 'Title' ko select karein.")
+                st.info("💡 Aapne ek Category Header select kiya hai. Detail dekhne ke liye usko expand karein aur andar kisi account ('Title') par click karein.")
         else:
-            st.info("👆 Upar wali table se account select karein taake uska Fact Ledger yahan show ho sake.")
+            st.info("👆 Upar table mein kisi account ke amount par click karein taake uska Fact Ledger yahan show ho sake.")
 
     except Exception as e:
         st.error(f"❌ Error processing the file. (Details: {e})")
