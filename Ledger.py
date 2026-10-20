@@ -80,6 +80,9 @@ def visible_rows(summary, expanded):
         old, new = float(part['2025'].sum()), float(part['2026'].sum())
         change = (new - old) / abs(old) if old != 0 else None
         marker = ('− ' if path in expanded else '+ ') if len(path) < 3 else ''
+        if len(path) < 3:
+            count = part[CODE].nunique()
+            label = f'{label} ({count} {"account" if count == 1 else "accounts"})'
         rows.append({'Hierarchy': '    ' * (len(path) - 1) + marker + label,
                      '2026': new, '2025': old, '% Change': change,
                      '_level': len(path), '_path': json.dumps(path, ensure_ascii=False, separators=(',', ':')),
