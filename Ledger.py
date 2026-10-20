@@ -67,8 +67,8 @@ def load_data(content):
 def make_summary(df):
     pivot = df.pivot_table(index=[MAIN, SUB, CODE, 'Title'], columns='Year', values=AMOUNT,
                            aggfunc='sum', fill_value=0, observed=True)
-    pivot = pivot.reindex(columns=[2025, 2026], fill_value=0).mul(-1)
-    pivot.columns = ['Sep 2025', 'Sep 2026']
+    pivot = pivot.reindex(columns=[2026, 2025], fill_value=0).mul(-1)
+    pivot.columns = ['2026', '2025']
     return pivot.reset_index()
 
 
@@ -76,12 +76,12 @@ def visible_rows(summary, expanded):
     rows, paths = [], []
 
     def append_row(part, path, label):
-        old, new = float(part['Sep 2025'].sum()), float(part['Sep 2026'].sum())
+        old, new = float(part['2025'].sum()), float(part['2026'].sum())
         change = (new - old) / abs(old) if old != 0 else None
         marker = ('− ' if path in expanded else '+ ') if len(path) < 3 else ''
         rows.append({'Hierarchy': '    ' * (len(path) - 1) + marker + label,
-                     'Sep 2025': old, 'Sep 2026': new, '% Change': change,
-                     '_id': len(paths)})
+                     '2026': new, '2025': old, '% Change': change,
+                     '_level': len(path), '_id': len(paths)})
         paths.append(path)
 
     main_values = sorted(summary[MAIN].unique(), key=lambda x: (ORDER.index(x) if x in ORDER else len(ORDER), x))
@@ -101,7 +101,7 @@ def visible_rows(summary, expanded):
 
 def run():
     st.set_page_config(layout='wide', page_title='September Financial Dashboard')
-    st.title('September 2025 vs 2026 Ledger Dashboard')
+    st.title('September 2026 vs 2025 Ledger Dashboard')
     upload = st.file_uploader('Upload an SAP Excel workbook containing the General Ledger and Acct class worksheets.', type=['xlsx'])
     if upload is None:
         st.info('Upload your Excel workbook to view the financial summary and ledger details.')
@@ -131,17 +131,40 @@ def run():
                     opened.update(tuple(row) for row in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
                 st.session_state.expanded = opened
                 st.session_state.grid_revision += 1
+        st.caption('Level 1: bold navy rows · Level 2: light blue rows · Level 3: indented white account rows')
         table, paths = visible_rows(summary, st.session_state.expanded)
         gb = GridOptionsBuilder.from_dataframe(table)
         gb.configure_default_column(sortable=False, filter=False, resizable=True)
         gb.configure_column('_id', hide=True)
+        gb.configure_column('_level', hide=True)
         gb.configure_column('Hierarchy', header_name='Main Class / Sub Class / Account', minWidth=450,
                             cellStyle={'whiteSpace': 'pre'})
         money = JsCode("function(p) { return p.value == null ? '' : Number(p.value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }")
         percent = JsCode("function(p) { return p.value == null ? 'N/A' : Number(p.value).toLocaleString('en-US', {style:'percent', minimumFractionDigits:2, maximumFractionDigits:2}); }")
-        for col in ['Sep 2025', 'Sep 2026']:
+        for col in ['2026', '2025']:
             gb.configure_column(col, type=['numericColumn'], valueFormatter=money)
         gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
+        gb.configure_grid_options(
+            getRowStyle=JsCode("""function(p) {
+                if (!p.data) return {};
+                if (p.data._level === 1) return {
+                    backgroundColor: '#17324d', color: '#ffffff',
+                    fontWeight: '700', fontSize: '14px',
+                    borderTop: '2px solid #ffffff'
+                };
+                if (p.data._level === 2) return {
+                    backgroundColor: '#e7eff7', color: '#17324d',
+                    fontWeight: '600', fontSize: '13px',
+                    borderBottom: '1px solid #cedcea'
+                };
+                return {
+                    backgroundColor: '#ffffff', color: '#374151',
+                    fontWeight: '400', fontSize: '13px',
+                    borderBottom: '1px solid #eef2f6'
+                };
+            }"""),
+            getRowHeight=JsCode("function(p) { return p.data && p.data._level === 1 ? 44 : 36; }")
+        )
         gb.configure_selection('single', use_checkbox=False)
         response = AgGrid(table, gridOptions=gb.build(), height=480, theme='streamlit',
                           allow_unsafe_jscode=True, update_on=['selectionChanged'],
