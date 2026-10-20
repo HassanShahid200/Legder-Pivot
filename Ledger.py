@@ -1,138 +1,193 @@
-import streamlit as st
+import hashlib
+from io import BytesIO
+
 import pandas as pd
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+import streamlit as st
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
-st.set_page_config(layout="wide", page_title="September Financial Dashboard")
-st.title("September 2025 vs 2026 Ledger Dashboard")
+ORDER = [
+    'Sales - net', 'Cost of sales', 'Selling and distribution expenses',
+    'Administrative expenses', 'Other operating incomes',
+    'Other operating expenses', 'Finance Costs', 'Taxation',
+]
+MAIN, SUB, CODE = 'Current Main Class', 'Current Sub Class', 'Acct Code'
+AMOUNT = 'Deb./Cred. (LC)'
 
-uploaded_file = st.file_uploader("Apni SAP Excel File yahan upload karein ('General Ledger' aur 'Acct class' sheets zaroori hain)", type=['xlsx'])
 
-if uploaded_file is not None:
-    @st.cache_data
-    def load_data(file):
-        gl_df = pd.read_excel(file, sheet_name='General Ledger')
-        acct_df = pd.read_excel(file, sheet_name='Acct class')
-        
-        gl_df['Posting Date'] = pd.to_datetime(gl_df['Posting Date'])
-        
-        sep_df = gl_df[gl_df['Posting Date'].dt.month == 9].copy()
-        sep_df['Year'] = sep_df['Posting Date'].dt.year.astype(str)
-        
-        df = pd.merge(sep_df, acct_df, left_on='Acct Code', right_on='Account code', how='left')
-        
-        df['Current Main Class'] = df['Current Main Class'].fillna('Unclassified')
-        df['Current Sub Class'] = df['Current Sub Class'].fillna('Unclassified')
-        df['Title'] = df['Title'].fillna(df['Acct Name'])
-        
-        return df
+def normalize_code(series):
+    return series.astype('string').str.strip().str.replace(r'\.0$', '', regex=True).replace('', pd.NA)
 
+
+@st.cache_data
+def load_data(content):
+    with pd.ExcelFile(BytesIO(content)) as workbook:
+        missing = {'General Ledger', 'Acct class'} - set(workbook.sheet_names)
+        if missing:
+            raise ValueError('Missing worksheets: ' + ', '.join(sorted(missing)))
+        gl = pd.read_excel(workbook, sheet_name='General Ledger')
+        mapping = pd.read_excel(workbook, sheet_name='Acct class')
+    for table, required, label in [
+        (gl, [CODE, 'Acct Name', 'Posting Date', AMOUNT], 'General Ledger'),
+        (mapping, ['Account code', MAIN, SUB, 'Title'], 'Acct class'),
+    ]:
+        table.columns = table.columns.astype(str).str.strip()
+        missing = set(required) - set(table.columns)
+        if missing:
+            raise ValueError(f'{label}: missing columns: {", ".join(sorted(missing))}')
+    gl[CODE] = normalize_code(gl[CODE])
+    mapping['Account code'] = normalize_code(mapping['Account code'])
+    if gl[CODE].isna().any():
+        raise ValueError('General Ledger contains blank account codes. Correct them before uploading.')
+    mapping = mapping[['Account code', MAIN, SUB, 'Title']].dropna(subset=['Account code'])
+    for col in [MAIN, SUB, 'Title']:
+        mapping[col] = mapping[col].astype('string').str.strip().replace('', pd.NA)
+    mapping = mapping.drop_duplicates()
+    duplicates = mapping.loc[mapping['Account code'].duplicated(False), 'Account code'].unique()
+    if len(duplicates):
+        raise ValueError('Conflicting account classifications for codes: ' + ', '.join(duplicates[:10]))
+    dates = pd.to_datetime(gl['Posting Date'], errors='coerce')
+    if dates.isna().any():
+        raise ValueError('General Ledger contains missing or invalid posting dates. Correct them before uploading.')
+    amounts = pd.to_numeric(gl[AMOUNT], errors='coerce')
+    if amounts.isna().any():
+        raise ValueError('General Ledger contains missing or nonnumeric ledger amounts.')
+    gl['Posting Date'], gl[AMOUNT] = dates, amounts
+    # Remove any old classifications so the mapping sheet remains authoritative.
+    gl = gl.drop(columns=[MAIN, SUB, 'Title'], errors='ignore')
+    df = gl.merge(mapping, left_on=CODE, right_on='Account code', how='left', validate='many_to_one')
+    df[MAIN] = df[MAIN].fillna('Unclassified')
+    df[SUB] = df[SUB].fillna('Unclassified')
+    df['Title'] = df['Title'].fillna(df['Acct Name']).fillna(df[CODE])
+    # One stable display title per code; drill-down always uses the account code.
+    df['Title'] = df.groupby(CODE, sort=False)['Title'].transform('first')
+    df['Year'] = df['Posting Date'].dt.year
+    return df.loc[df['Posting Date'].dt.month.eq(9) & df['Year'].isin([2025, 2026])].copy()
+
+
+def make_summary(df):
+    pivot = df.pivot_table(index=[MAIN, SUB, CODE, 'Title'], columns='Year', values=AMOUNT,
+                           aggfunc='sum', fill_value=0, observed=True)
+    pivot = pivot.reindex(columns=[2025, 2026], fill_value=0).mul(-1)
+    pivot.columns = ['Sep 2025', 'Sep 2026']
+    return pivot.reset_index()
+
+
+def visible_rows(summary, expanded):
+    rows, paths = [], []
+
+    def append_row(part, path, label):
+        old, new = float(part['Sep 2025'].sum()), float(part['Sep 2026'].sum())
+        change = (new - old) / abs(old) if old != 0 else None
+        marker = ('− ' if path in expanded else '+ ') if len(path) < 3 else ''
+        rows.append({'Hierarchy': '    ' * (len(path) - 1) + marker + label,
+                     'Sep 2025': old, 'Sep 2026': new, '% Change': change,
+                     '_id': len(paths)})
+        paths.append(path)
+
+    main_values = sorted(summary[MAIN].unique(), key=lambda x: (ORDER.index(x) if x in ORDER else len(ORDER), x))
+    for main in main_values:
+        part = summary.loc[summary[MAIN].eq(main)]
+        append_row(part, (main,), main)
+        if (main,) not in expanded:
+            continue
+        for sub, subgroup in part.groupby(SUB, sort=True):
+            append_row(subgroup, (main, sub), sub)
+            if (main, sub) in expanded:
+                for _, account in subgroup.sort_values(['Title', CODE]).iterrows():
+                    append_row(account.to_frame().T, (main, sub, account[CODE]),
+                               f"{account['Title']} [{account[CODE]}]")
+    return pd.DataFrame(rows), paths
+
+
+def run():
+    st.set_page_config(layout='wide', page_title='September Financial Dashboard')
+    st.title('September 2025 vs 2026 Ledger Dashboard')
+    upload = st.file_uploader('Upload an SAP Excel workbook containing the General Ledger and Acct class worksheets.', type=['xlsx'])
+    if upload is None:
+        st.info('Upload your Excel workbook to view the financial summary and ledger details.')
+        return
     try:
-        df = load_data(uploaded_file)
-        
-        main_class_order = [
-            'Sales - net',
-            'Cost of sales',
-            'Selling and distribution expenses',
-            'Administrative expenses',
-            'Other operating incomes',
-            'Other operating expenses',
-            'Finance Costs',
-            'Taxation'
-        ]
-        
-        df['Main_Class_Sort'] = pd.Categorical(df['Current Main Class'], categories=main_class_order, ordered=True)
-        
-        pivot_df = pd.pivot_table(
-            df, 
-            values='Deb./Cred. (LC)', 
-            index=['Main_Class_Sort', 'Current Main Class', 'Current Sub Class', 'Title'], 
-            columns='Year', 
-            aggfunc='sum',
-            fill_value=0
-        ).reset_index()
+        content = upload.getvalue()
+        fingerprint = hashlib.sha256(content).hexdigest()
+        if st.session_state.get('workbook_id') != fingerprint:
+            st.session_state.update(workbook_id=fingerprint, expanded=set(), grid_revision=0)
+        df = load_data(content)
+        if df.empty:
+            st.warning('No September transactions were found for 2025 or 2026.')
+            return
+        summary = make_summary(df)
+        unclassified = df.loc[df[MAIN].eq('Unclassified'), CODE].nunique()
+        if unclassified:
+            st.warning(f'{unclassified} account(s) have no main classification and are shown under Unclassified.')
+        st.subheader('1. September Profit and Loss Summary')
+        st.caption('P&L values = ledger values × −1. Ledger details retain their original debit/credit signs. Percentage change uses the absolute prior-year balance; a zero prior-year balance is shown as N/A.')
+        controls = st.columns(3)
+        for depth, label in enumerate(['Level 1 · Main Classes / Collapse All', 'Level 2 · Sub Classes', 'Level 3 · Accounts / Expand All'], 1):
+            if controls[depth - 1].button(label, use_container_width=True):
+                opened = set()
+                if depth >= 2:
+                    opened.update((main,) for main in summary[MAIN].unique())
+                if depth >= 3:
+                    opened.update(tuple(row) for row in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
+                st.session_state.expanded = opened
+                st.session_state.grid_revision += 1
+        table, paths = visible_rows(summary, st.session_state.expanded)
+        gb = GridOptionsBuilder.from_dataframe(table)
+        gb.configure_default_column(sortable=False, filter=False, resizable=True)
+        gb.configure_column('_id', hide=True)
+        gb.configure_column('Hierarchy', header_name='Main Class / Sub Class / Account', minWidth=450,
+                            cellStyle={'whiteSpace': 'pre'})
+        money = JsCode("function(p) { return p.value == null ? '' : Number(p.value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }")
+        percent = JsCode("function(p) { return p.value == null ? 'N/A' : Number(p.value).toLocaleString('en-US', {style:'percent', minimumFractionDigits:2, maximumFractionDigits:2}); }")
+        for col in ['Sep 2025', 'Sep 2026']:
+            gb.configure_column(col, type=['numericColumn'], valueFormatter=money)
+        gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
+        gb.configure_selection('single', use_checkbox=False)
+        response = AgGrid(table, gridOptions=gb.build(), height=480, theme='streamlit',
+                          allow_unsafe_jscode=True, update_on=['selectionChanged'],
+                          key=f'financial_grid_{fingerprint}_{st.session_state.grid_revision}')
+        st.caption('Click any row or amount to open its ledger. Select a main class or sub class, then use Expand Selected or Collapse Selected to change that branch.')
+        selected = response['selected_rows']
+        if selected is None or len(selected) == 0:
+            st.info('Select a main class, sub class, or account to view its September ledger.')
+            return
+        row = selected.iloc[0] if isinstance(selected, pd.DataFrame) else selected[0]
+        path = paths[int(row['_id'])]
+        if len(path) < 3:
+            expand, collapse, _ = st.columns([1, 1, 3])
+            if expand.button('Expand Selected'):
+                st.session_state.expanded.add(path)
+                st.session_state.grid_revision += 1
+                st.rerun()
+            if collapse.button('Collapse Selected'):
+                st.session_state.expanded = {p for p in st.session_state.expanded if p[:len(path)] != path}
+                st.session_state.grid_revision += 1
+                st.rerun()
+        st.divider()
+        st.subheader('2. Ledger Details')
+        st.write('Selected scope: ' + ' → '.join(path))
+        year = st.radio('Select the ledger year', [2026, 2025], horizontal=True)
+        mask = df[MAIN].eq(path[0]) & df['Year'].eq(year)
+        if len(path) >= 2:
+            mask &= df[SUB].eq(path[1])
+        if len(path) == 3:
+            mask &= df[CODE].eq(path[2])
+        detail = df.loc[mask].copy().sort_values('Posting Date')
+        a, b = st.columns(2)
+        a.metric(f'Transactions · September {year}', len(detail))
+        b.metric('Original Ledger Net Amount', f'{detail[AMOUNT].sum():,.2f}')
+        columns = [CODE, 'Acct Name', MAIN, SUB, 'Title', 'Posting Date', 'Origin', 'Doc No',
+                   'Remarks', 'Offset Acct', 'Offset Acct Name', AMOUNT]
+        detail = detail[[col for col in columns if col in detail.columns]].copy()
+        detail['Posting Date'] = detail['Posting Date'].dt.strftime('%Y-%m-%d')
+        if detail.empty:
+            st.info('No September transactions were found for this selection and year.')
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+        st.download_button('Download Selected Ledger (CSV)', detail.to_csv(index=False).encode('utf-8-sig'),
+                           file_name=f'september_{year}_ledger.csv', mime='text/csv')
+    except Exception as exc:
+        st.error(f'Unable to process the workbook: {exc}')
 
-        pivot_df.columns = [str(c) for c in pivot_df.columns]
-        
-        if '2025' in pivot_df.columns:
-            pivot_df.rename(columns={'2025': 'Sep 2025'}, inplace=True)
-        else:
-            pivot_df['Sep 2025'] = 0.0
 
-        if '2026' in pivot_df.columns:
-            pivot_df.rename(columns={'2026': 'Sep 2026'}, inplace=True)
-        else:
-            pivot_df['Sep 2026'] = 0.0
-
-        pivot_df['% Change'] = (pivot_df['Sep 2026'] - pivot_df['Sep 2025']) / pivot_df['Sep 2025'].replace(0, pd.NA)
-        pivot_df['% Change'] = pivot_df['% Change'].fillna(0)
-
-        pivot_df = pivot_df.sort_values(by=['Main_Class_Sort', 'Current Sub Class', 'Title'])
-        pivot_df = pivot_df.drop(columns=['Main_Class_Sort'])
-        
-        pivot_df['Current Main Class'] = pivot_df['Current Main Class'].astype(str)
-        pivot_df['Current Sub Class'] = pivot_df['Current Sub Class'].astype(str)
-        pivot_df['Title'] = pivot_df['Title'].astype(str)
-
-        st.subheader("1. September Summary Pivot")
-        st.write("Table ko expand karein aur kisi bhi account ke amount par click karein.")
-
-        gb = GridOptionsBuilder.from_dataframe(pivot_df)
-        gb.configure_column('Current Main Class', rowGroup=True, hide=True)
-        gb.configure_column('Current Sub Class', rowGroup=True, hide=True)
-        gb.configure_column('Title', rowGroup=False)
-        
-        # FIXED: aggFunc='sum' add kiya hai taake groups blank na rahein
-        gb.configure_column('Sep 2026', type=["numericColumn"], valueFormatter="x.toLocaleString('en-US', {minimumFractionDigits: 2})", aggFunc='sum')
-        gb.configure_column('Sep 2025', type=["numericColumn"], valueFormatter="x.toLocaleString('en-US', {minimumFractionDigits: 2})", aggFunc='sum')
-        gb.configure_column('% Change', valueFormatter="x.toLocaleString(undefined, {style: 'percent', minimumFractionDigits: 2})")
-        
-        # FIXED: use_checkbox=False kar diya hai. Ab amount/row par direct click kaam karega.
-        gb.configure_selection(selection_mode='single', use_checkbox=False)
-        gridOptions = gb.build()
-
-        grid_response = AgGrid(
-            pivot_df,
-            gridOptions=gridOptions,
-            update_mode=GridUpdateMode.SELECTION_CHANGED,
-            enable_enterprise_modules=True,
-            height=450,
-            theme='streamlit'
-        )
-
-        selected_rows = grid_response['selected_rows']
-        st.markdown("---")
-
-        if selected_rows is not None and len(selected_rows) > 0:
-            if isinstance(selected_rows, pd.DataFrame):
-                selected_row = selected_rows.iloc[0]
-            else:
-                selected_row = selected_rows[0]
-                
-            selected_title = selected_row.get('Title')
-            
-            # Agar group header par click hua toh Title None/NaN hoga
-            if pd.notna(selected_title) and selected_title != "":
-                st.subheader(f"2. Fact Ledger Detail: {selected_title}")
-                
-                selected_year = st.radio("👇 Konsay saal ka poora ledger dekhna chahte hain?", ["2026", "2025"], horizontal=True)
-                
-                detail_df = df[(df['Title'] == selected_title) & (df['Year'] == selected_year)]
-                
-                cols_to_show = ['Acct Code', 'Posting Date', 'Origin', 'Doc No', 'Remarks', 'Offset Acct', 'Offset Acct Name', 'Deb./Cred. (LC)']
-                detail_df['Posting Date'] = detail_df['Posting Date'].dt.strftime('%Y-%m-%d')
-                
-                st.write(f"**Total Transactions (Sep {selected_year}):** {len(detail_df)}")
-                st.dataframe(
-                    detail_df[cols_to_show].sort_values(by='Posting Date'),
-                    use_container_width=True,
-                    hide_index=True
-                )
-            else:
-                st.info("💡 Aapne ek Category Header select kiya hai. Detail dekhne ke liye usko expand karein aur andar kisi account ('Title') par click karein.")
-        else:
-            st.info("👆 Click to Ledger Amount")
-
-    except Exception as e:
-        st.error(f"❌ Error processing the file. (Details: {e})")
-else:
-    st.info("📂 Please Upload your Excel File")
+if __name__ == '__main__':
+    run()
