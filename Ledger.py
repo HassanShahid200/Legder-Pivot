@@ -1,4 +1,5 @@
 import hashlib
+import json
 from io import BytesIO
 
 import pandas as pd
@@ -81,7 +82,8 @@ def visible_rows(summary, expanded):
         marker = ('− ' if path in expanded else '+ ') if len(path) < 3 else ''
         rows.append({'Hierarchy': '    ' * (len(path) - 1) + marker + label,
                      '2026': new, '2025': old, '% Change': change,
-                     '_level': len(path), '_action': '', '_id': len(paths)})
+                     '_level': len(path), '_path': json.dumps(path, ensure_ascii=False, separators=(',', ':')),
+                     '_expanded': '', '_action': '', '_id': len(paths)})
         paths.append(path)
 
     main_values = sorted(summary[MAIN].unique(), key=lambda x: (ORDER.index(x) if x in ORDER else len(ORDER), x))
@@ -102,6 +104,10 @@ def visible_rows(summary, expanded):
 def run():
     st.set_page_config(layout='wide', page_title='September Financial Dashboard')
     st.title('September 2026 vs 2025 Ledger Dashboard')
+    # Initialize new keys even when an existing session survives an app update.
+    for key, default in [('expanded', set()), ('grid_revision', 0),
+                         ('ledger_path', None), ('ledger_year', 2026)]:
+        st.session_state.setdefault(key, default)
     upload = st.file_uploader('Upload an SAP Excel workbook containing the General Ledger and Acct class worksheets.', type=['xlsx'])
     if upload is None:
         st.info('Upload your Excel workbook to view the financial summary and ledger details.')
@@ -132,12 +138,16 @@ def run():
                 st.session_state.expanded = opened
                 st.session_state.grid_revision += 1
         st.caption('Level 1: bold navy rows · Level 2: light blue rows · Level 3: indented white account rows')
-        table, paths = visible_rows(summary, st.session_state.expanded)
+        all_branches = {(m,) for m in summary[MAIN].unique()}
+        all_branches.update(tuple(r) for r in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
+        table, paths = visible_rows(summary, all_branches)
         gb = GridOptionsBuilder.from_dataframe(table)
         gb.configure_default_column(sortable=False, filter=False, resizable=True)
         gb.configure_column('_id', hide=True)
         gb.configure_column('_level', hide=True)
         gb.configure_column('_action', hide=True)
+        gb.configure_column('_path', hide=True)
+        gb.configure_column('_expanded', hide=True)
         gb.configure_column('Hierarchy', header_name='Main Class / Sub Class / Account', minWidth=450,
                             cellStyle={'whiteSpace': 'pre'},
                             cellRenderer=JsCode("""class HierarchyRenderer {
@@ -151,14 +161,28 @@ def run():
                     if (p.data._level < 3) {
                         const button = document.createElement('button');
                         button.type = 'button';
-                        button.textContent = label.slice(0, 1);
-                        button.title = label.startsWith('+') ? 'Expand category' : 'Collapse category';
+                        const isOpen = (window.__ledgerExpanded || p.context.expanded).includes(p.data._path);
+                        button.textContent = isOpen ? '−' : '+';
+                        button.title = isOpen ? 'Collapse category' : 'Expand category';
                         button.setAttribute('aria-label', button.title);
-                        button.setAttribute('aria-expanded', String(!label.startsWith('+')));
+                        button.setAttribute('aria-expanded', String(isOpen));
                         button.style.cssText = 'cursor:pointer;width:26px;height:26px;margin-right:9px;border:1px solid currentColor;border-radius:5px;background:transparent;color:inherit;font-size:18px;line-height:20px;';
                         button.addEventListener('click', function(e) {
                             e.stopPropagation();
-                            p.node.setDataValue('_action', 'toggle:' + Date.now());
+                            const key = p.data._path;
+                            const opened = window.__ledgerExpanded || p.context.expanded;
+                            if (opened.includes(key)) {
+                                const prefix = JSON.parse(key);
+                                p.context.expanded = opened.filter(function(item) {
+                                    const path = JSON.parse(item);
+                                    return !prefix.every((value, i) => path[i] === value);
+                                });
+                            } else {
+                                p.context.expanded = opened.concat([key]);
+                            }
+                            window.__ledgerExpanded = p.context.expanded;
+                            p.api.onFilterChanged();
+                            p.api.refreshCells({columns: ['Hierarchy'], force: true});
                         });
                         this.el.appendChild(button);
                     }
@@ -174,9 +198,24 @@ def run():
             gb.configure_column(col, type=['numericColumn'], valueFormatter=money)
         gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
         gb.configure_grid_options(
+            context={'expanded': [json.dumps(path, ensure_ascii=False, separators=(',', ':'))
+                                  for path in sorted(st.session_state.expanded)]},
+            isExternalFilterPresent=JsCode('function() { return true; }'),
+            doesExternalFilterPass=JsCode('''function(p) {
+                const path = JSON.parse(p.data._path);
+                for (let depth = 1; depth < path.length; depth++) {
+                    if (!(window.__ledgerExpanded || []).includes(JSON.stringify(path.slice(0, depth)))) return false;
+                }
+                return true;
+            }'''),
+            onGridReady=JsCode('function(p) { window.__ledgerExpanded = p.context.expanded.slice(); p.api.onFilterChanged(); }'),
+            onFirstDataRendered=JsCode('function(p) { p.api.onFilterChanged(); }'),
             onCellClicked=JsCode('''function(p) {
                 if (!p.data || p.colDef.field === '_action') return;
                 // Toggle buttons stop propagation; every other cell opens the ledger.
+                // Keep one pending action and preserve the browser's expanded branches.
+                p.api.forEachNode(function(node) { node.data._action = ''; });
+                p.data._expanded = JSON.stringify(window.__ledgerExpanded || p.context.expanded);
                 p.node.setDataValue('_action', 'ledger:' + p.colDef.field + ':' + Date.now());
             }'''),
             getRowStyle=JsCode("""function(p) {
@@ -211,22 +250,16 @@ def run():
                 action_row = actions.iloc[-1]
                 action_path = paths[int(action_row['_id'])]
                 action = str(action_row['_action'])
-                if action.startswith('toggle:') and len(action_path) < 3:
-                    if action_path in st.session_state.expanded:
-                        st.session_state.expanded = {
-                            item for item in st.session_state.expanded
-                            if item[:len(action_path)] != action_path
-                        }
-                    else:
-                        st.session_state.expanded.add(action_path)
-                elif action.startswith('ledger:'):
+                token = (fingerprint, st.session_state.grid_revision, int(action_row['_id']), action)
+                if action.startswith('ledger:') and st.session_state.get('handled_action') != token:
+                    st.session_state.handled_action = token
                     st.session_state.ledger_path = action_path
+                    opened = action_row.get('_expanded', '')
+                    if opened:
+                        st.session_state.expanded = {tuple(json.loads(item)) for item in json.loads(opened)}
                     clicked_column = action.split(':')[1]
                     if clicked_column in ('2026', '2025'):
                         st.session_state.ledger_year = int(clicked_column)
-                # Recreate the grid to clear handled actions and avoid replay on reruns.
-                st.session_state.grid_revision += 1
-                st.rerun()
         path = st.session_state.ledger_path
         if path is None:
             st.info('Click a category name or amount to view its September ledger.')
