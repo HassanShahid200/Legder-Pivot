@@ -130,9 +130,9 @@ if uploaded_file is not None:
             else:
                 st.info("💡 Aapne ek Category Header select kiya hai. Detail dekhne ke liye usko expand karein aur andar kisi account ('Title') par click karein.")
         else:
-            st.info("👆 Upar table mein kisi account ke amount par click karein taake uska Fact Ledger yahan show ho sake.")
+            st.info("👆 Click to Ledger Amount")
 
     except Exception as e:
         st.error(f"❌ Error processing the file. (Details: {e})")
 else:
-    st.info("📂 Upload button par click karein aur file attach karein.")
+    st.info("📂 Please Upload your Excel File")
