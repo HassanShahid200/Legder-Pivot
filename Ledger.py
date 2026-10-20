@@ -130,16 +130,6 @@ def run():
             st.warning(f'{unclassified} account(s) have no main classification and are shown under Unclassified.')
         st.subheader('1. September Profit and Loss Summary')
         st.caption('P&L values = ledger values × −1. Ledger details retain their original debit/credit signs. Percentage change uses the absolute prior-year balance; a zero prior-year balance is shown as N/A.')
-        controls = st.columns(3)
-        for depth, label in enumerate(['Level 1 · Main Classes / Collapse All', 'Level 2 · Sub Classes', 'Level 3 · Accounts / Expand All'], 1):
-            if controls[depth - 1].button(label, use_container_width=True):
-                opened = set()
-                if depth >= 2:
-                    opened.update((main,) for main in summary[MAIN].unique())
-                if depth >= 3:
-                    opened.update(tuple(row) for row in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
-                st.session_state.expanded = opened
-                st.session_state.grid_revision += 1
         st.caption('Level 1: bold navy rows · Level 2: light blue rows · Level 3: indented white account rows')
         all_branches = {(m,) for m in summary[MAIN].unique()}
         all_branches.update(tuple(r) for r in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
@@ -153,9 +143,44 @@ def run():
         gb.configure_column('_expanded', hide=True)
         gb.configure_column('Hierarchy', header_name='Main Class / Sub Class / Account', minWidth=450,
                             cellStyle={'whiteSpace': 'pre'},
+                            headerComponent=JsCode("""class LevelHeader {
+                init(p) {
+                    this.el = document.createElement('div');
+                    this.el.style.cssText = 'width:100%;display:flex;flex-direction:column;gap:8px;';
+                    const title = document.createElement('span');
+                    title.textContent = p.displayName;
+                    this.el.appendChild(title);
+                    const controls = document.createElement('div');
+                    controls.style.cssText = 'display:flex;gap:6px;';
+                    ['Level 1', 'Level 2', 'Level 3'].forEach((label, index) => {
+                        const button = document.createElement('button');
+                        button.type = 'button';
+                        button.textContent = label;
+                        button.title = ['Main classes / collapse all', 'Show sub classes', 'Show accounts / expand all'][index];
+                        button.style.cssText = 'cursor:pointer;padding:4px 12px;border:1px solid #a7bbce;border-radius:5px;background:#ffffff;color:#17324d;font-size:13px;';
+                        button.addEventListener('click', (event) => {
+                            event.stopPropagation();
+                            const opened = [];
+                            p.api.forEachNode(node => {
+                                if (node.data && node.data._level <= index) opened.push(node.data._path);
+                            });
+                            p.context.expanded = opened;
+                            p.api.onFilterChanged();
+                            p.api.refreshCells({columns: ['Hierarchy'], force: true});
+                        });
+                        controls.appendChild(button);
+                    });
+                    this.el.appendChild(controls);
+                }
+                getGui() { return this.el; }
+            }"""),
                             cellRenderer=JsCode("""class HierarchyRenderer {
                 init(p) {
                     this.el = document.createElement('div');
+                    if (p.node.rowPinned) {
+                        this.el.textContent = p.value;
+                        return;
+                    }
                     this.el.style.display = 'flex';
                     this.el.style.alignItems = 'center';
                     this.el.style.height = '100%';
@@ -164,7 +189,7 @@ def run():
                     if (p.data._level < 3) {
                         const button = document.createElement('button');
                         button.type = 'button';
-                        const isOpen = (window.__ledgerExpanded || p.context.expanded).includes(p.data._path);
+                        const isOpen = (p.context.expanded || []).includes(p.data._path);
                         button.textContent = isOpen ? '−' : '+';
                         button.title = isOpen ? 'Collapse category' : 'Expand category';
                         button.setAttribute('aria-label', button.title);
@@ -173,7 +198,7 @@ def run():
                         button.addEventListener('click', function(e) {
                             e.stopPropagation();
                             const key = p.data._path;
-                            const opened = window.__ledgerExpanded || p.context.expanded;
+                            const opened = p.context.expanded || [];
                             if (opened.includes(key)) {
                                 const prefix = JSON.parse(key);
                                 p.context.expanded = opened.filter(function(item) {
@@ -183,7 +208,6 @@ def run():
                             } else {
                                 p.context.expanded = opened.concat([key]);
                             }
-                            window.__ledgerExpanded = p.context.expanded;
                             p.api.onFilterChanged();
                             p.api.refreshCells({columns: ['Hierarchy'], force: true});
                         });
@@ -200,29 +224,38 @@ def run():
         for col in ['2026', '2025']:
             gb.configure_column(col, type=['numericColumn'], valueFormatter=money)
         gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
+        total_new, total_old = float(summary['2026'].sum()), float(summary['2025'].sum())
         gb.configure_grid_options(
+            headerHeight=78,
+            pinnedBottomRowData=[{'Hierarchy': 'Grand Total', '2026': total_new,
+                                  '2025': total_old,
+                                  '% Change': (total_new - total_old) / abs(total_old) if total_old else None}],
             context={'expanded': [json.dumps(path, ensure_ascii=False, separators=(',', ':'))
                                   for path in sorted(st.session_state.expanded)]},
             isExternalFilterPresent=JsCode('function() { return true; }'),
             doesExternalFilterPass=JsCode('''function(p) {
                 const path = JSON.parse(p.data._path);
                 for (let depth = 1; depth < path.length; depth++) {
-                    if (!(window.__ledgerExpanded || []).includes(JSON.stringify(path.slice(0, depth)))) return false;
+                    if (!(p.context.expanded || []).includes(JSON.stringify(path.slice(0, depth)))) return false;
                 }
                 return true;
             }'''),
-            onGridReady=JsCode('function(p) { window.__ledgerExpanded = p.context.expanded.slice(); p.api.onFilterChanged(); }'),
+            onGridReady=JsCode('function(p) { p.api.onFilterChanged(); }'),
             onFirstDataRendered=JsCode('function(p) { p.api.onFilterChanged(); }'),
             onCellClicked=JsCode('''function(p) {
-                if (!p.data || p.colDef.field === '_action') return;
+                if (!p.data || p.node.rowPinned || p.colDef.field === '_action') return;
                 // Toggle buttons stop propagation; every other cell opens the ledger.
                 // Keep one pending action and preserve the browser's expanded branches.
                 p.api.forEachNode(function(node) { node.data._action = ''; });
-                p.data._expanded = JSON.stringify(window.__ledgerExpanded || p.context.expanded);
+                p.data._expanded = JSON.stringify(p.context.expanded || []);
                 p.node.setDataValue('_action', 'ledger:' + p.colDef.field + ':' + Date.now());
             }'''),
             getRowStyle=JsCode("""function(p) {
                 if (!p.data) return {};
+                if (p.node.rowPinned) return {
+                    backgroundColor: '#17324d', color: '#ffffff', fontWeight: '700',
+                    fontSize: '14px', borderTop: '2px solid #a7bbce'
+                };
                 if (p.data._level === 1) return {
                     backgroundColor: '#17324d', color: '#ffffff',
                     fontWeight: '700', fontSize: '14px',
@@ -244,8 +277,8 @@ def run():
         gb.configure_selection('single', use_checkbox=False)
         response = AgGrid(table, gridOptions=gb.build(), height=480, theme='streamlit',
                           allow_unsafe_jscode=True, update_on=['cellValueChanged'],
-                          key=f'financial_grid_{fingerprint}_{st.session_state.grid_revision}')
-        st.caption('Click + or − beside a category to expand or collapse it. Click a name or amount to open its ledger.')
+                          key=f'financial_grid_{fingerprint}')
+        st.caption('Use Level 1 / 2 / 3 in the grid header. Click + or − beside a category to expand or collapse it. Click a name or amount to open its ledger.')
         returned = response.data
         if isinstance(returned, pd.DataFrame) and '_action' in returned.columns:
             actions = returned.loc[returned['_action'].fillna('').ne('')]
@@ -280,13 +313,23 @@ def run():
         a, b = st.columns(2)
         a.metric(f'Transactions · September {year}', len(detail))
         b.metric('Original Ledger Net Amount', f'{detail[AMOUNT].sum():,.2f}')
+        detail['Debit'] = detail[AMOUNT].clip(lower=0)
+        detail['Credit'] = -detail[AMOUNT].clip(upper=0)
+        st.caption('Positive GL amounts appear in Debit; negative GL amounts appear as positive Credit values. Net = Debit − Credit.')
         columns = [CODE, 'Acct Name', MAIN, SUB, 'Title', 'Posting Date', 'Origin', 'Doc No',
-                   'Remarks', 'Offset Acct', 'Offset Acct Name', AMOUNT]
+                   'Remarks', 'Offset Acct', 'Offset Acct Name', 'Debit', 'Credit', AMOUNT]
         detail = detail[[col for col in columns if col in detail.columns]].copy()
         detail['Posting Date'] = detail['Posting Date'].dt.strftime('%Y-%m-%d')
         if detail.empty:
             st.info('No September transactions were found for this selection and year.')
-        st.dataframe(detail, use_container_width=True, hide_index=True)
+        total_row = {col: '' for col in detail.columns}
+        total_row[CODE] = 'Grand Total'
+        for col in ['Debit', 'Credit', AMOUNT]:
+            total_row[col] = float(detail[col].sum())
+        detail = pd.concat([detail, pd.DataFrame([total_row])], ignore_index=True)
+        st.dataframe(detail, use_container_width=True, hide_index=True,
+                     column_config={col: st.column_config.NumberColumn(format='%.2f')
+                                    for col in ['Debit', 'Credit', AMOUNT]})
         st.download_button('Download Selected Ledger (CSV)', detail.to_csv(index=False).encode('utf-8-sig'),
                            file_name=f'september_{year}_ledger.csv', mime='text/csv')
     except Exception as exc:
