@@ -81,7 +81,7 @@ def visible_rows(summary, expanded):
         marker = ('− ' if path in expanded else '+ ') if len(path) < 3 else ''
         rows.append({'Hierarchy': '    ' * (len(path) - 1) + marker + label,
                      '2026': new, '2025': old, '% Change': change,
-                     '_level': len(path), '_id': len(paths)})
+                     '_level': len(path), '_action': '', '_id': len(paths)})
         paths.append(path)
 
     main_values = sorted(summary[MAIN].unique(), key=lambda x: (ORDER.index(x) if x in ORDER else len(ORDER), x))
@@ -110,7 +110,7 @@ def run():
         content = upload.getvalue()
         fingerprint = hashlib.sha256(content).hexdigest()
         if st.session_state.get('workbook_id') != fingerprint:
-            st.session_state.update(workbook_id=fingerprint, expanded=set(), grid_revision=0)
+            st.session_state.update(workbook_id=fingerprint, expanded=set(), grid_revision=0, ledger_path=None)
         df = load_data(content)
         if df.empty:
             st.warning('No September transactions were found for 2025 or 2026.')
@@ -137,14 +137,48 @@ def run():
         gb.configure_default_column(sortable=False, filter=False, resizable=True)
         gb.configure_column('_id', hide=True)
         gb.configure_column('_level', hide=True)
+        gb.configure_column('_action', hide=True)
         gb.configure_column('Hierarchy', header_name='Main Class / Sub Class / Account', minWidth=450,
-                            cellStyle={'whiteSpace': 'pre'})
+                            cellStyle={'whiteSpace': 'pre'},
+                            cellRenderer=JsCode("""class HierarchyRenderer {
+                init(p) {
+                    this.el = document.createElement('div');
+                    this.el.style.display = 'flex';
+                    this.el.style.alignItems = 'center';
+                    this.el.style.height = '100%';
+                    this.el.style.paddingLeft = ((p.data._level - 1) * 22) + 'px';
+                    const label = String(p.value || '').trim();
+                    if (p.data._level < 3) {
+                        const button = document.createElement('button');
+                        button.type = 'button';
+                        button.textContent = label.slice(0, 1);
+                        button.title = label.startsWith('+') ? 'Expand category' : 'Collapse category';
+                        button.setAttribute('aria-label', button.title);
+                        button.setAttribute('aria-expanded', String(!label.startsWith('+')));
+                        button.style.cssText = 'cursor:pointer;width:26px;height:26px;margin-right:9px;border:1px solid currentColor;border-radius:5px;background:transparent;color:inherit;font-size:18px;line-height:20px;';
+                        button.addEventListener('click', function(e) {
+                            e.stopPropagation();
+                            p.node.setDataValue('_action', 'toggle:' + Date.now());
+                        });
+                        this.el.appendChild(button);
+                    }
+                    const text = document.createElement('span');
+                    text.textContent = p.data._level < 3 ? label.slice(2) : label;
+                    this.el.appendChild(text);
+                }
+                getGui() { return this.el; }
+            }"""))
         money = JsCode("function(p) { return p.value == null ? '' : Number(p.value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }")
         percent = JsCode("function(p) { return p.value == null ? 'N/A' : Number(p.value).toLocaleString('en-US', {style:'percent', minimumFractionDigits:2, maximumFractionDigits:2}); }")
         for col in ['2026', '2025']:
             gb.configure_column(col, type=['numericColumn'], valueFormatter=money)
         gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
         gb.configure_grid_options(
+            onCellClicked=JsCode('''function(p) {
+                if (!p.data || p.colDef.field === '_action') return;
+                // Toggle buttons stop propagation; every other cell opens the ledger.
+                p.node.setDataValue('_action', 'ledger:' + p.colDef.field + ':' + Date.now());
+            }'''),
             getRowStyle=JsCode("""function(p) {
                 if (!p.data) return {};
                 if (p.data._level === 1) return {
@@ -167,29 +201,40 @@ def run():
         )
         gb.configure_selection('single', use_checkbox=False)
         response = AgGrid(table, gridOptions=gb.build(), height=480, theme='streamlit',
-                          allow_unsafe_jscode=True, update_on=['selectionChanged'],
+                          allow_unsafe_jscode=True, update_on=['cellValueChanged'],
                           key=f'financial_grid_{fingerprint}_{st.session_state.grid_revision}')
-        st.caption('Click any row or amount to open its ledger. Select a main class or sub class, then use Expand Selected or Collapse Selected to change that branch.')
-        selected = response['selected_rows']
-        if selected is None or len(selected) == 0:
-            st.info('Select a main class, sub class, or account to view its September ledger.')
+        st.caption('Click + or − beside a category to expand or collapse it. Click a name or amount to open its ledger.')
+        returned = response.data
+        if isinstance(returned, pd.DataFrame) and '_action' in returned.columns:
+            actions = returned.loc[returned['_action'].fillna('').ne('')]
+            if not actions.empty:
+                action_row = actions.iloc[-1]
+                action_path = paths[int(action_row['_id'])]
+                action = str(action_row['_action'])
+                if action.startswith('toggle:') and len(action_path) < 3:
+                    if action_path in st.session_state.expanded:
+                        st.session_state.expanded = {
+                            item for item in st.session_state.expanded
+                            if item[:len(action_path)] != action_path
+                        }
+                    else:
+                        st.session_state.expanded.add(action_path)
+                elif action.startswith('ledger:'):
+                    st.session_state.ledger_path = action_path
+                    clicked_column = action.split(':')[1]
+                    if clicked_column in ('2026', '2025'):
+                        st.session_state.ledger_year = int(clicked_column)
+                # Recreate the grid to clear handled actions and avoid replay on reruns.
+                st.session_state.grid_revision += 1
+                st.rerun()
+        path = st.session_state.ledger_path
+        if path is None:
+            st.info('Click a category name or amount to view its September ledger.')
             return
-        row = selected.iloc[0] if isinstance(selected, pd.DataFrame) else selected[0]
-        path = paths[int(row['_id'])]
-        if len(path) < 3:
-            expand, collapse, _ = st.columns([1, 1, 3])
-            if expand.button('Expand Selected'):
-                st.session_state.expanded.add(path)
-                st.session_state.grid_revision += 1
-                st.rerun()
-            if collapse.button('Collapse Selected'):
-                st.session_state.expanded = {p for p in st.session_state.expanded if p[:len(path)] != path}
-                st.session_state.grid_revision += 1
-                st.rerun()
         st.divider()
         st.subheader('2. Ledger Details')
         st.write('Selected scope: ' + ' → '.join(path))
-        year = st.radio('Select the ledger year', [2026, 2025], horizontal=True)
+        year = st.radio('Select the ledger year', [2026, 2025], horizontal=True, key='ledger_year')
         mask = df[MAIN].eq(path[0]) & df['Year'].eq(year)
         if len(path) >= 2:
             mask &= df[SUB].eq(path[1])
