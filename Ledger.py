@@ -62,7 +62,7 @@ def load_data(content):
     # One stable display title per code; drill-down always uses the account code.
     df['Title'] = df.groupby(CODE, sort=False)['Title'].transform('first')
     df['Year'] = df['Posting Date'].dt.year
-    return df.loc[df['Posting Date'].dt.month.eq(9) & df['Year'].isin([2025, 2026])].copy()
+    return df.loc[df['Year'].isin([2025, 2026])].copy()
 
 
 def make_summary(df):
@@ -78,7 +78,7 @@ def visible_rows(summary, expanded):
 
     def append_row(part, path, label):
         old, new = float(part['2025'].sum()), float(part['2026'].sum())
-        change = (new - old) / abs(old) if old != 0 else None
+        change = (new - old) / old if old != 0 else None
         marker = ('− ' if path in expanded else '+ ') if len(path) < 3 else ''
         if len(path) < 3:
             count = part[CODE].nunique()
@@ -105,8 +105,8 @@ def visible_rows(summary, expanded):
 
 
 def run():
-    st.set_page_config(layout='wide', page_title='September Financial Dashboard')
-    st.title('September 2026 vs 2025 Ledger Dashboard')
+    st.set_page_config(layout='wide', page_title='Financial Dashboard')
+    st.title('2026 vs 2025 Ledger Dashboard')
     # Initialize new keys even when an existing session survives an app update.
     for key, default in [('expanded', set()), ('grid_revision', 0),
                          ('ledger_path', None), ('ledger_year', 2026)]:
@@ -121,15 +121,23 @@ def run():
         if st.session_state.get('workbook_id') != fingerprint:
             st.session_state.update(workbook_id=fingerprint, expanded=set(), grid_revision=0, ledger_path=None)
         df = load_data(content)
+        period = st.radio('Reporting period', ['All uploaded months (matches Excel pivot)', 'September only'],
+                          horizontal=True, key='reporting_period')
+        view_id = fingerprint + ('_september' if period == 'September only' else '_all')
+        if st.session_state.get('report_view_id') != view_id:
+            st.session_state.update(report_view_id=view_id, expanded=set(), ledger_path=None)
+        if period == 'September only':
+            df = df.loc[df['Posting Date'].dt.month.eq(9)].copy()
         if df.empty:
-            st.warning('No September transactions were found for 2025 or 2026.')
+            st.warning('No transactions were found for the selected period in 2025 or 2026.')
             return
         summary = make_summary(df)
         unclassified = df.loc[df[MAIN].eq('Unclassified'), CODE].nunique()
         if unclassified:
             st.warning(f'{unclassified} account(s) have no main classification and are shown under Unclassified.')
-        st.subheader('1. September Profit and Loss Summary')
-        st.caption('P&L values = ledger values × −1. Ledger details retain their original debit/credit signs. Percentage change uses the absolute prior-year balance; a zero prior-year balance is shown as N/A.')
+        st.subheader('1. Profit and Loss Summary')
+        st.caption('Period: ' + period + '. Includes only transactions present in the uploaded workbook.')
+        st.caption('P&L values = ledger values × −1. Ledger details retain their original debit/credit signs. Percentage change = (2026 − 2025) ÷ 2025, matching Excel; a zero prior-year balance is shown as N/A.')
         st.caption('Level 1: bold navy rows · Level 2: light blue rows · Level 3: indented white account rows')
         all_branches = {(m,) for m in summary[MAIN].unique()}
         all_branches.update(tuple(r) for r in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
@@ -229,7 +237,7 @@ def run():
             headerHeight=78,
             pinnedBottomRowData=[{'Hierarchy': 'Grand Total', '2026': total_new,
                                   '2025': total_old,
-                                  '% Change': (total_new - total_old) / abs(total_old) if total_old else None}],
+                                  '% Change': (total_new - total_old) / total_old if total_old else None}],
             context={'expanded': [json.dumps(path, ensure_ascii=False, separators=(',', ':'))
                                   for path in sorted(st.session_state.expanded)]},
             isExternalFilterPresent=JsCode('function() { return true; }'),
@@ -277,7 +285,7 @@ def run():
         gb.configure_selection('single', use_checkbox=False)
         response = AgGrid(table, gridOptions=gb.build(), height=480, theme='streamlit',
                           allow_unsafe_jscode=True, update_on=['cellValueChanged'],
-                          key=f'financial_grid_v2_{fingerprint}')
+                          key=f'financial_grid_v3_{view_id}')
         st.caption('Use Level 1 / 2 / 3 in the grid header. Click + or − beside a category to expand or collapse it. Click a name or amount to open its ledger.')
         returned = response.data
         if isinstance(returned, pd.DataFrame) and '_action' in returned.columns:
@@ -298,7 +306,7 @@ def run():
                         st.session_state.ledger_year = int(clicked_column)
         path = st.session_state.ledger_path
         if path is None:
-            st.info('Click a category name or amount to view its September ledger.')
+            st.info('Click a category name or amount to view its ledger.')
             return
         st.divider()
         st.subheader('2. Ledger Details')
@@ -311,7 +319,7 @@ def run():
             mask &= df[CODE].eq(path[2])
         detail = df.loc[mask].copy().sort_values('Posting Date')
         a, b = st.columns(2)
-        a.metric(f'Transactions · September {year}', len(detail))
+        a.metric(f'Transactions · {year}', len(detail))
         b.metric('Original Ledger Net Amount', f'{detail[AMOUNT].sum():,.2f}')
         detail['Debit'] = detail[AMOUNT].clip(lower=0)
         detail['Credit'] = -detail[AMOUNT].clip(upper=0)
@@ -321,7 +329,7 @@ def run():
         detail = detail[[col for col in columns if col in detail.columns]].copy()
         detail['Posting Date'] = detail['Posting Date'].dt.strftime('%Y-%m-%d')
         if detail.empty:
-            st.info('No September transactions were found for this selection and year.')
+            st.info('No transactions were found for this selection and year.')
         total_row = {col: '' for col in detail.columns}
         total_row[CODE] = 'Grand Total'
         for col in ['Debit', 'Credit', AMOUNT]:
@@ -331,7 +339,7 @@ def run():
                      column_config={col: st.column_config.NumberColumn(format='%.2f')
                                     for col in ['Debit', 'Credit', AMOUNT]})
         st.download_button('Download Selected Ledger (CSV)', detail.to_csv(index=False).encode('utf-8-sig'),
-                           file_name=f'september_{year}_ledger.csv', mime='text/csv')
+                           file_name=f'{view_id[-9:]}_{year}_ledger.csv', mime='text/csv')
     except Exception as exc:
         st.error(f'Unable to process the workbook: {exc}')
 
