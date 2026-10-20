@@ -8,7 +8,7 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, DataReturnMode
 
 ORDER = [
     'Sales - net', 'Cost of sales', 'Selling and distribution expenses',
@@ -175,6 +175,8 @@ def report_link(base, token):
     parsed = urlsplit(base.strip())
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError('Enter your full https:// Streamlit app URL.')
+    if 'your-app' in parsed.hostname.lower() or parsed.hostname.lower() == 'yourapp.streamlit.app':
+        raise ValueError('Replace YOUR-APP with your actual Streamlit app address from your browser.')
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or '/',
                        urlencode({'report': token}), ''))
 
@@ -399,7 +401,7 @@ def run():
         money = JsCode("function(p) { return p.value == null ? '' : Number(p.value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }")
         percent = JsCode("function(p) { return p.value == null ? 'N/A' : Number(p.value).toLocaleString('en-US', {style:'percent', minimumFractionDigits:2, maximumFractionDigits:2}); }")
         for col in ['2026', '2025']:
-            gb.configure_column(col, type=['numericColumn'], valueFormatter=money)
+            gb.configure_column(col, type=['numericColumn'], minWidth=210, valueFormatter=money)
         gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
         gb.configure_column('Comments', minWidth=280, width=360, wrapText=True, autoHeight=True,
                             editable=JsCode('function(p) { return !p.node.rowPinned; }') if not read_only else False,
@@ -431,7 +433,7 @@ def run():
                 // Keep one pending action and preserve the browser's expanded branches.
                 p.api.forEachNode(function(node) { node.data._action = ''; });
                 p.data._expanded = JSON.stringify(window.__ledgerExpanded || []);
-                p.node.setDataValue('_action', 'ledger:' + p.colDef.field + ':' + Date.now());
+                p.data._action = 'ledger:' + p.colDef.field + ':' + Date.now();
             }'''),
             onCellValueChanged=JsCode('''function(p) {
                 if (p.colDef.field === 'Comments') {
@@ -465,8 +467,19 @@ def run():
         )
         gb.configure_selection('single', use_checkbox=False)
         response = AgGrid(table, gridOptions=gb.build(), height=480, theme='streamlit',
-                          allow_unsafe_jscode=True, update_on=['cellValueChanged'],
-                          key=f'financial_grid_v4_{source_id}_{view_id}_{read_only}')
+                          allow_unsafe_jscode=True,
+                          update_on=['cellClicked', 'cellValueChanged'],
+                          data_return_mode=DataReturnMode.AS_INPUT,
+                          should_grid_return=JsCode('''function(p) {
+                              const event = p.eventData;
+                              if (!event || !event.data || (event.node && event.node.rowPinned)) return false;
+                              const field = event.colDef && event.colDef.field;
+                              if (p.streamlitRerunEventTriggerName === 'cellClicked') {
+                                  return ['Hierarchy', '2026', '2025', '% Change'].includes(field);
+                              }
+                              return p.streamlitRerunEventTriggerName === 'cellValueChanged' && field === 'Comments';
+                          }'''),
+                          key=f'financial_grid_v5_{source_id}_{view_id}_{read_only}')
         st.caption('Use Level 1 / 2 / 3 in the grid header. Click + or − beside a category to expand or collapse it. Click a name or amount to open its ledger.')
         returned = response.data
         if not read_only:
