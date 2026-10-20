@@ -1,5 +1,9 @@
 import hashlib
 import json
+import hmac
+import secrets
+import uuid
+from urllib.parse import urlsplit, urlunsplit, urlencode
 from io import BytesIO
 
 import pandas as pd
@@ -104,6 +108,163 @@ def visible_rows(summary, expanded):
     return pd.DataFrame(rows), paths
 
 
+
+def cloud_client():
+    from supabase import create_client
+    url = str(st.secrets.get('SUPABASE_URL', '')).rstrip('/')
+    key = str(st.secrets.get('SUPABASE_SECRET_KEY', ''))
+    parsed = urlsplit(url)
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.path not in ('', '/'):
+        raise ValueError('Set SUPABASE_URL to the project URL ending in .supabase.co, not the dashboard URL.')
+    if not key:
+        raise ValueError('Add SUPABASE_SECRET_KEY in Streamlit Secrets.')
+    return create_client(url, key)
+
+
+def token_digest(token):
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def fetch_shared_report(token):
+    # A link is a read-only capability. Never accept a file path or report ID from a visitor.
+    if not isinstance(token, str) or len(token) != 43 or any(c not in
+            'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in token):
+        raise ValueError('This report link is invalid.')
+    client = cloud_client()
+    records = client.table('ledger_reports').select('*').eq(
+        'share_token_hash', token_digest(token)).limit(1).execute().data
+    if not records:
+        raise ValueError('This report link is invalid or has been disabled.')
+    report = records[0]
+    # Password-protected records must never silently fall back to link-only access.
+    if report.get('viewer_password_hash'):
+        raise ValueError('This report requires a password and cannot be opened by this app version.')
+    bucket = str(st.secrets.get('SUPABASE_BUCKET', 'Ledger_Reports'))
+    content = client.storage.from_(bucket).download(report['file_path'])
+    return report, content
+
+
+def save_report_snapshot(content, filename, title, comments, period):
+    if not st.session_state.get('editor_authenticated'):
+        raise PermissionError('Sign in as the report editor before saving.')
+    client = cloud_client()
+    bucket = str(st.secrets.get('SUPABASE_BUCKET', 'Ledger_Reports'))
+    report_id = str(uuid.uuid4())
+    path = report_id + '/workbook.xlsx'
+    token = secrets.token_urlsafe(32)
+    client.storage.from_(bucket).upload(path=path, file=content,
+        file_options={'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                      'upsert': 'false'})
+    payload = {'id': report_id, 'title': title.strip() or 'Financial Report',
+               'file_path': path, 'original_filename': filename,
+               'comments': dict(comments), 'reporting_period': period,
+               'share_token_hash': token_digest(token)}
+    try:
+        client.table('ledger_reports').insert(payload).execute()
+    except Exception:
+        # A failed table write should not leave an unused workbook behind.
+        try:
+            client.storage.from_(bucket).remove([path])
+        except Exception:
+            pass
+        raise RuntimeError('Report was not saved. Check the ledger_reports table and Supabase settings.') from None
+    return token
+
+
+def report_link(base, token):
+    parsed = urlsplit(base.strip())
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError('Enter your full https:// Streamlit app URL.')
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or '/',
+                       urlencode({'report': token}), ''))
+
+
+def merge_comments(returned, valid_paths, comments):
+    if not isinstance(returned, pd.DataFrame) or not {'_path', 'Comments'}.issubset(returned.columns):
+        return
+    valid = set(valid_paths)
+    for _, row in returned.iterrows():
+        path = row['_path']
+        if path in valid:
+            value = row['Comments']
+            text = '' if pd.isna(value) else str(value)[:4000]
+            if text:
+                comments[path] = text
+            else:
+                comments.pop(path, None)
+
+
+def report_source():
+    token = st.query_params.get('report', '')
+    if token:
+        try:
+            if st.session_state.get('loaded_share_token') != token:
+                report, content = fetch_shared_report(token)
+                st.session_state.update(loaded_share_token=token, shared_report=report,
+                                        shared_content=content, expanded=set(), ledger_path=None)
+            report = st.session_state.shared_report
+            st.subheader(report['title'])
+            st.caption('Shared report · View only')
+            return st.session_state.shared_content, report['original_filename'], report, True
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception:
+            st.error('Unable to open this report. Please ask the report owner to check the saved link and connection settings.')
+        return None
+
+    expected = str(st.secrets.get('EDITOR_PASSWORD', ''))
+    if not expected:
+        st.info('Add EDITOR_PASSWORD in Streamlit Secrets to enable report editing. Choose a password of at least 12 characters.')
+        return None
+    # Invalidate existing editor sessions when the configured password changes.
+    signature = token_digest(expected)
+    if st.session_state.get('editor_password_signature') != signature:
+        st.session_state.editor_authenticated = False
+    if not st.session_state.get('editor_authenticated'):
+        with st.form('editor_login'):
+            password = st.text_input('Report editor password', type='password')
+            submitted = st.form_submit_button('Open report editor')
+        if submitted:
+            if hmac.compare_digest(password.encode(), expected.encode()):
+                st.session_state.update(editor_authenticated=True, editor_password_signature=signature)
+                st.rerun()
+            else:
+                st.error('Incorrect editor password.')
+        return None
+    if st.sidebar.button('Sign out'):
+        st.session_state.clear()
+        st.rerun()
+    mode = st.radio('Report source', ['Upload Excel workbook', 'Open saved report'], horizontal=True)
+    if mode == 'Upload Excel workbook':
+        upload = st.file_uploader('Upload an SAP Excel workbook containing the General Ledger and Acct class worksheets.', type=['xlsx'])
+        if upload is None:
+            st.info('Upload your Excel workbook to start.')
+            return None
+        return upload.getvalue(), upload.name, None, False
+    try:
+        records = cloud_client().table('ledger_reports').select(
+            'id,title,created_at,share_token_hash').order('created_at', desc=True).limit(100).execute().data
+        if not records:
+            st.info('No saved reports yet. Upload a workbook and save your first report.')
+            return None
+        choices = {r['id']: r for r in records}
+        selected = st.selectbox('Saved reports (latest 100)', list(choices),
+            format_func=lambda rid: choices[rid]['title'] + ' · ' + choices[rid]['created_at'][:19])
+        if st.button('Open selected report'):
+            client = cloud_client()
+            report = client.table('ledger_reports').select('*').eq('id', selected).limit(1).execute().data[0]
+            content = client.storage.from_(str(st.secrets.get('SUPABASE_BUCKET', 'Ledger_Reports'))).download(report['file_path'])
+            st.session_state.update(editor_saved_report=report, editor_saved_content=content,
+                                    draft_source=None, expanded=set(), ledger_path=None)
+        saved = st.session_state.get('editor_saved_report')
+        if saved and saved['id'] == selected:
+            return st.session_state.editor_saved_content, saved['original_filename'], saved, False
+        st.info('Click Open selected report to load its workbook and comments.')
+    except Exception:
+        st.error('Unable to load saved reports. Check Supabase Secrets and the ledger_reports table.')
+    return None
+
+
 def run():
     st.set_page_config(layout='wide', page_title='Financial Dashboard')
     st.title('2026 vs 2025 Ledger Dashboard')
@@ -111,18 +272,24 @@ def run():
     for key, default in [('expanded', set()), ('grid_revision', 0),
                          ('ledger_path', None), ('ledger_year', 2026)]:
         st.session_state.setdefault(key, default)
-    upload = st.file_uploader('Upload an SAP Excel workbook containing the General Ledger and Acct class worksheets.', type=['xlsx'])
-    if upload is None:
-        st.info('Upload your Excel workbook to view the financial summary and ledger details.')
+    source = report_source()
+    if source is None:
         return
+    content, filename, saved_report, read_only = source
     try:
-        content = upload.getvalue()
         fingerprint = hashlib.sha256(content).hexdigest()
         if st.session_state.get('workbook_id') != fingerprint:
             st.session_state.update(workbook_id=fingerprint, expanded=set(), grid_revision=0, ledger_path=None)
         df = load_data(content)
+        source_id = (saved_report['id'] if saved_report else 'upload') + ':' + fingerprint
+        if st.session_state.get('draft_source') != source_id:
+            st.session_state.update(draft_source=source_id,
+                draft_comments=dict(saved_report.get('comments') or {}) if saved_report else {},
+                reporting_period=('September only' if saved_report and saved_report['reporting_period'] == 'september'
+                                  else 'All uploaded months (matches Excel pivot)'),
+                saved_share_url=None)
         period = st.radio('Reporting period', ['All uploaded months (matches Excel pivot)', 'September only'],
-                          horizontal=True, key='reporting_period')
+                          horizontal=True, key='reporting_period', disabled=read_only)
         view_id = fingerprint + ('_september' if period == 'September only' else '_all')
         if st.session_state.get('report_view_id') != view_id:
             st.session_state.update(report_view_id=view_id, expanded=set(), ledger_path=None)
@@ -142,8 +309,10 @@ def run():
         all_branches = {(m,) for m in summary[MAIN].unique()}
         all_branches.update(tuple(r) for r in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
         table, paths = visible_rows(summary, all_branches)
+        comments = st.session_state.draft_comments
+        table['Comments'] = table['_path'].map(comments).fillna('')
         gb = GridOptionsBuilder.from_dataframe(table)
-        gb.configure_default_column(sortable=False, filter=False, resizable=True)
+        gb.configure_default_column(sortable=False, filter=False, resizable=True, editable=False)
         gb.configure_column('_id', hide=True)
         gb.configure_column('_level', hide=True)
         gb.configure_column('_action', hide=True)
@@ -232,9 +401,15 @@ def run():
         for col in ['2026', '2025']:
             gb.configure_column(col, type=['numericColumn'], valueFormatter=money)
         gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
+        gb.configure_column('Comments', minWidth=280, width=360, wrapText=True, autoHeight=True,
+                            editable=JsCode('function(p) { return !p.node.rowPinned; }') if not read_only else False,
+                            cellEditor='agLargeTextCellEditor', cellEditorPopup=True,
+                            cellEditorParams={'maxLength': 4000, 'rows': 5, 'cols': 45})
         total_new, total_old = float(summary['2026'].sum()), float(summary['2025'].sum())
         gb.configure_grid_options(
             headerHeight=78,
+            stopEditingWhenCellsLoseFocus=True,
+            getRowId=JsCode("function(p) { return p.data._path; }"),
             pinnedBottomRowData=[{'Hierarchy': 'Grand Total', '2026': total_new,
                                   '2025': total_old,
                                   '% Change': (total_new - total_old) / total_old if total_old else None}],
@@ -251,12 +426,18 @@ def run():
             onGridReady=JsCode('function(p) { window.__ledgerExpanded = ((p.context && p.context.expanded) || []).slice(); p.api.onFilterChanged(); }'),
             onFirstDataRendered=JsCode('function(p) { p.api.onFilterChanged(); }'),
             onCellClicked=JsCode('''function(p) {
-                if (!p.data || p.node.rowPinned || p.colDef.field === '_action') return;
+                if (!p.data || p.node.rowPinned || ['_action', 'Comments'].includes(p.colDef.field)) return;
                 // Toggle buttons stop propagation; every other cell opens the ledger.
                 // Keep one pending action and preserve the browser's expanded branches.
                 p.api.forEachNode(function(node) { node.data._action = ''; });
                 p.data._expanded = JSON.stringify(window.__ledgerExpanded || []);
                 p.node.setDataValue('_action', 'ledger:' + p.colDef.field + ':' + Date.now());
+            }'''),
+            onCellValueChanged=JsCode('''function(p) {
+                if (p.colDef.field === 'Comments') {
+                    p.api.forEachNode(function(node) { node.data._action = ''; });
+                    p.data._expanded = JSON.stringify(window.__ledgerExpanded || []);
+                }
             }'''),
             getRowStyle=JsCode("""function(p) {
                 if (!p.data) return {};
@@ -285,9 +466,17 @@ def run():
         gb.configure_selection('single', use_checkbox=False)
         response = AgGrid(table, gridOptions=gb.build(), height=480, theme='streamlit',
                           allow_unsafe_jscode=True, update_on=['cellValueChanged'],
-                          key=f'financial_grid_v3_{view_id}')
+                          key=f'financial_grid_v4_{source_id}_{view_id}_{read_only}')
         st.caption('Use Level 1 / 2 / 3 in the grid header. Click + or − beside a category to expand or collapse it. Click a name or amount to open its ledger.')
         returned = response.data
+        if not read_only:
+            merge_comments(returned, table['_path'], comments)
+            if isinstance(returned, pd.DataFrame) and '_expanded' in returned.columns:
+                states = returned['_expanded'].dropna()
+                states = states.loc[states.ne('')]
+                if not states.empty:
+                    st.session_state.expanded = {tuple(json.loads(item)) for item in json.loads(states.iloc[-1])}
+            st.caption('Double-click a Comments cell to edit. Press Ctrl+Enter or click outside the editor to finish. Draft comments are saved online only when you click Save & Share Report.')
         if isinstance(returned, pd.DataFrame) and '_action' in returned.columns:
             actions = returned.loc[returned['_action'].fillna('').ne('')]
             if not actions.empty:
@@ -304,6 +493,28 @@ def run():
                     clicked_column = action.split(':')[1]
                     if clicked_column in ('2026', '2025'):
                         st.session_state.ledger_year = int(clicked_column)
+        if not read_only:
+            st.divider()
+            title = st.text_input('Report title', value=saved_report['title'] if saved_report else '2026 vs 2025 Financial Report',
+                                  key='report_title_' + source_id)
+            base_url = st.text_input('Your Streamlit app URL', value=str(st.secrets.get('APP_URL', '')),
+                                     placeholder='https://your-app.streamlit.app', key='share_base_url')
+            st.caption('Each save creates a separate report snapshot. Anyone with its link can view it; they cannot edit comments.')
+            if st.button('Save & Share Report', type='primary'):
+                try:
+                    report_link(base_url, 'check')
+                    with st.spinner('Saving workbook and comments…'):
+                        share_token = save_report_snapshot(content, filename, title, comments,
+                                                           'september' if period == 'September only' else 'all')
+                    st.session_state.saved_share_url = report_link(base_url, share_token)
+                    st.success('Report and comments saved. Copy the link below for your boss.')
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception:
+                    st.error('Could not save the report. Check your Supabase URL, secret key, Ledger_Reports bucket, and ledger_reports table.')
+            if st.session_state.get('saved_share_url'):
+                st.code(st.session_state.saved_share_url, language=None)
+                st.caption('This link contains the most recently saved snapshot. Save again after changing comments or figures.')
         path = st.session_state.ledger_path
         if path is None:
             st.info('Click a category name or amount to view its ledger.')
