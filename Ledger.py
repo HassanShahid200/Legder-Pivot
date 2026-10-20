@@ -164,7 +164,7 @@ def run():
                             p.api.forEachNode(node => {
                                 if (node.data && node.data._level <= index) opened.push(node.data._path);
                             });
-                            p.context.expanded = opened;
+                            window.__ledgerExpanded = opened;
                             p.api.onFilterChanged();
                             p.api.refreshCells({columns: ['Hierarchy'], force: true});
                         });
@@ -189,7 +189,7 @@ def run():
                     if (p.data._level < 3) {
                         const button = document.createElement('button');
                         button.type = 'button';
-                        const isOpen = (p.context.expanded || []).includes(p.data._path);
+                        const isOpen = (window.__ledgerExpanded || []).includes(p.data._path);
                         button.textContent = isOpen ? '−' : '+';
                         button.title = isOpen ? 'Collapse category' : 'Expand category';
                         button.setAttribute('aria-label', button.title);
@@ -198,15 +198,15 @@ def run():
                         button.addEventListener('click', function(e) {
                             e.stopPropagation();
                             const key = p.data._path;
-                            const opened = p.context.expanded || [];
+                            const opened = window.__ledgerExpanded || [];
                             if (opened.includes(key)) {
                                 const prefix = JSON.parse(key);
-                                p.context.expanded = opened.filter(function(item) {
+                                window.__ledgerExpanded = opened.filter(function(item) {
                                     const path = JSON.parse(item);
                                     return !prefix.every((value, i) => path[i] === value);
                                 });
                             } else {
-                                p.context.expanded = opened.concat([key]);
+                                window.__ledgerExpanded = opened.concat([key]);
                             }
                             p.api.onFilterChanged();
                             p.api.refreshCells({columns: ['Hierarchy'], force: true});
@@ -236,18 +236,18 @@ def run():
             doesExternalFilterPass=JsCode('''function(p) {
                 const path = JSON.parse(p.data._path);
                 for (let depth = 1; depth < path.length; depth++) {
-                    if (!(p.context.expanded || []).includes(JSON.stringify(path.slice(0, depth)))) return false;
+                    if (!(window.__ledgerExpanded || []).includes(JSON.stringify(path.slice(0, depth)))) return false;
                 }
                 return true;
             }'''),
-            onGridReady=JsCode('function(p) { p.api.onFilterChanged(); }'),
+            onGridReady=JsCode('function(p) { window.__ledgerExpanded = ((p.context && p.context.expanded) || []).slice(); p.api.onFilterChanged(); }'),
             onFirstDataRendered=JsCode('function(p) { p.api.onFilterChanged(); }'),
             onCellClicked=JsCode('''function(p) {
                 if (!p.data || p.node.rowPinned || p.colDef.field === '_action') return;
                 // Toggle buttons stop propagation; every other cell opens the ledger.
                 // Keep one pending action and preserve the browser's expanded branches.
                 p.api.forEachNode(function(node) { node.data._action = ''; });
-                p.data._expanded = JSON.stringify(p.context.expanded || []);
+                p.data._expanded = JSON.stringify(window.__ledgerExpanded || []);
                 p.node.setDataValue('_action', 'ledger:' + p.colDef.field + ':' + Date.now());
             }'''),
             getRowStyle=JsCode("""function(p) {
@@ -277,7 +277,7 @@ def run():
         gb.configure_selection('single', use_checkbox=False)
         response = AgGrid(table, gridOptions=gb.build(), height=480, theme='streamlit',
                           allow_unsafe_jscode=True, update_on=['cellValueChanged'],
-                          key=f'financial_grid_{fingerprint}')
+                          key=f'financial_grid_v2_{fingerprint}')
         st.caption('Use Level 1 / 2 / 3 in the grid header. Click + or − beside a category to expand or collapse it. Click a name or amount to open its ledger.')
         returned = response.data
         if isinstance(returned, pd.DataFrame) and '_action' in returned.columns:
